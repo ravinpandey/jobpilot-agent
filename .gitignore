@@ -1,0 +1,14 @@
+.venv/
+.venv311/
+__pycache__/
+*.pyc
+
+# Local data (per-user DB, uploaded resumes, generated tailored resumes)
+data/
+
+# Env files / secrets
+.env
+*.env
+
+# OS / editor cruft
+.DS_Store
