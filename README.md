@@ -47,48 +47,152 @@ tailor your resume per job, and run searches autonomously.
 
 ## How it works
 
+### Layered architecture
+
+```mermaid
+flowchart TB
+    subgraph UI["UI Layer — Streamlit (streamlit_app.py)"]
+        direction LR
+        U1[Profile]
+        U2[Resume]
+        U3[Search]
+        U4[Ranked Jobs]
+        U5[AI Assistant]
+        U6[Tailor Resume]
+    end
+
+    subgraph API["API Layer — FastAPI (app/main.py)"]
+        direction LR
+        A1["Deterministic REST API\n/users, /jobs, /search, /feedback"]
+        A2["Agents API\n/agents/* (app/agents_api.py)"]
+    end
+
+    subgraph ORC["Orchestration Layer"]
+        O1["Orchestrator Agent\nagents/orchestrator.py\nrun_chat_turn — Sonnet"]
+    end
+
+    subgraph AGENTS["Specialized Agents — each its own MCP server"]
+        direction LR
+        AG1["Discovery\nrun_discovery — Haiku"]
+        AG2["Scoring\nscore_and_explain — Sonnet"]
+        AG3["Resume Tailoring\ntailor_resume — Sonnet"]
+        AG4["Feedback / Learning\nprocess_feedback — Haiku"]
+    end
+
+    subgraph TOOLS["Tool Layer"]
+        T1["pipeline-tools MCP server\nagents/mcp_servers/pipeline_tools_server.py"]
+    end
+
+    subgraph CORE["Deterministic Pipeline (app/)"]
+        direction LR
+        C1[pipeline.py]
+        C2[matcher.py]
+        C3[collector.py]
+        C4[feedback.py]
+        C5[resume_parser.py]
+    end
+
+    subgraph DATA["Data Layer"]
+        direction LR
+        D1[("SQLite\ndata/db/job_agent.db")]
+        D2["data/tailored_resumes/\n*.docx"]
+    end
+
+    subgraph EXT["External Services"]
+        direction LR
+        E1["AWS Bedrock\n Haiku / Sonnet 4.5"]
+        E2["Public Job Boards\nRemoteOK · JobTech SE · The Muse\nJobicy · Arbeitnow · Greenhouse/Lever · Adzuna"]
+    end
+
+    UI --> API
+    A1 --> CORE
+    A2 --> O1
+    O1 -- MCP stdio --> AG1
+    O1 -- MCP stdio --> AG2
+    O1 -- MCP stdio --> AG3
+    O1 -- MCP stdio --> AG4
+    AG1 -- MCP stdio --> T1
+    AG2 -- MCP stdio --> T1
+    AG3 -- MCP stdio --> T1
+    AG4 -- MCP stdio --> T1
+    T1 --> CORE
+    AG3 -- writes --> D2
+    O1 -.  calls .-> E1
+    AG1 -.  calls .-> E1
+    AG2 -.  calls .-> E1
+    AG3 -.  calls .-> E1
+    AG4 -.  calls .-> E1
+    CORE --> D1
+    C3 -. fetches .-> E2
 ```
-Streamlit UI  (Profile / Resume / Search / Ranked Jobs / AI Assistant / Tailor Resume)
-        |
-FastAPI backend (app/main.py)
-   |                                  |
-   | deterministic REST API           | /agents/* API (app/agents_api.py)
-   v                                  v
-Deterministic pipeline           Orchestrator agent (agents/orchestrator.py)
-(app/pipeline.py,                       |
- app/matcher.py,                  routes to 4 specialized agents (MCP servers):
- app/feedback.py,                   - discovery-agent  -> run_discovery
- app/collector.py,                  - scoring-agent    -> score_and_explain
- app/resume_parser.py)              - resume-agent     -> tailor_resume
-   |                                 - feedback-agent   -> process_feedback
-   |                                       |
-   |                          all call back into the deterministic pipeline
-   |                          via the pipeline-tools MCP server
-   |                          (agents/mcp_servers/pipeline_tools_server.py)
-   v                                       |
-        SQLite (data/db/job_agent.db) <----+
+
+### Data flow — deterministic search (REST)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Streamlit (Search tab)
+    participant API as FastAPI /users/{id}/search
+    participant Collector as collector.py
+    participant Matcher as matcher.py
+    participant DB as SQLite
+
+    User->>UI: Click "Search for jobs"
+    UI->>API: POST /users/{user_id}/search
+    API->>Collector: build queries from profile + collect_jobs()
+    Collector->>Collector: fetch RemoteOK, JobTech SE, The Muse,<br/>Jobicy, Arbeitnow, Greenhouse/Lever, Adzuna
+    Collector-->>API: deduped raw jobs
+    API->>Matcher: score_job() per job<br/>(TF-IDF + skill overlap + rules)
+    Matcher-->>API: scored + ranked jobs
+    API->>DB: upsert jobs + scores
+    API-->>UI: ranked job list
+    UI-->>User: Ranked Jobs tab updates
+```
+
+### Data flow — AI Assistant chat (multi-agent)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Streamlit (AI Assistant)
+    participant API as FastAPI /agents/chat
+    participant Orc as Orchestrator (Sonnet)
+    participant Disc as Discovery Agent (Haiku)
+    participant Score as Scoring Agent (Sonnet)
+    participant Tools as pipeline-tools MCP
+    participant DB as SQLite
+
+    User->>UI: "Find new jobs and explain the top 3"
+    UI->>API: POST /agents/chat {user_id, message, session_id}
+    API->>Orc: run_chat_turn(message)
+    Orc->>Disc: run_discovery(user_id)
+    Disc->>Tools: collect_jobs_for_user(user_id)
+    Tools->>DB: upsert jobs + scores
+    Tools-->>Disc: new jobs
+    Disc-->>Orc: discovery summary
+    Orc->>Score: score_and_explain(user_id)
+    Score->>Tools: list_ranked_jobs(user_id)
+    Tools-->>Score: ranked jobs + score_breakdown
+    Score-->>Orc: per-job explanations
+    Orc-->>API: reply + session_id
+    API-->>UI: chat response
+    UI-->>User: "Found 5 new jobs. Top match: ..."
 ```
 
 ### Deterministic pipeline
 
 The "core" logic is plain Python — no LLM involved, fully reproducible:
 
-```
-User profile (resume + preferences)
-        |
-Search Query Planner  -> generates queries from target roles + skills
-        |
-Job Collector          -> RemoteOK, JobTech SE, The Muse, Jobicy, Arbeitnow,
-        |                  Greenhouse/Lever company boards, (optional) Adzuna
-Dedup                  -> hash on URL / title+company+location
-        |
-Matching/Scoring        -> TF-IDF similarity + skill overlap + location/domain/company rules
-        |
-Ranked job list         -> stored per user
-        |
-Feedback (applied / shortlisted / skip / rejected_*)
-        |
-Skill weight learning   -> adjusts future scores
+```mermaid
+flowchart LR
+    A["User profile\n(resume + preferences)"] --> B["Search Query Planner\ngenerates queries from\ntarget roles + skills"]
+    B --> C["Job Collector\nRemoteOK, JobTech SE, The Muse,\nJobicy, Arbeitnow, Greenhouse/Lever,\n(optional) Adzuna"]
+    C --> D["Dedup\nhash on URL /\ntitle+company+location"]
+    D --> E["Matching / Scoring\nTF-IDF similarity + skill overlap\n+ location/domain/company rules"]
+    E --> F["Ranked job list\nstored per user"]
+    F --> G["Feedback\napplied / shortlisted /\nskip / rejected_*"]
+    G --> H["Skill weight learning\nadjusts future scores"]
+    H -.-> E
 ```
 
 ### Agent layer
