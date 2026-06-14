@@ -1,5 +1,7 @@
 # Job Agent
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A multi-user job discovery, matching, and tailoring agent. Users build a
 career profile (resume + preferences); a deterministic pipeline searches
 public job feeds, scores/ranks results, and learns from feedback. On top of
